@@ -11,8 +11,11 @@ app = Flask(__name__)
 # MYSQL
 # =========================
 db = mysql.connector.connect(
-    host="localhost", user="root",
-    password="1234", database="obd_car", port=3306
+    host="yamabiko.proxy.rlwy.net",
+    user="root",
+    password="KkBiCjCqXcxGbvOrxkbXNncDnsOwBamu",
+    database="railway",
+    port=40356
 )
 cursor = db.cursor()
 
