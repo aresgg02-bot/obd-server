@@ -30,8 +30,9 @@ def reconectar():
     try:
         db     = get_db()
         cursor = db.cursor()
+        print("🔄 Conexión a Base de Datos restablecida.", flush=True)
     except Exception as e:
-        print("❌ Reconexión fallida:", e)
+        print("❌ Reconexión fallida:", e, flush=True)
 
 # =========================
 # TELEGRAM
@@ -48,7 +49,7 @@ def telegram_send(chat_id, mensaje):
             "parse_mode": "Markdown"
         }, timeout=5)
     except Exception as e:
-        print("⚠ Telegram:", e)
+        print("⚠ Telegram:", e, flush=True)
 
 # =========================
 # ALERTAS
@@ -63,7 +64,7 @@ def enviar_alerta(tipo, mensaje, placa="X"):
         return
     cooldown[key] = ahora
     telegram_send(TELEGRAM_CHAT, mensaje)
-    print("🚨", tipo)
+    print("🚨 Alerta enviada:", tipo, flush=True)
 
 # =========================
 # CONSTANTES SPARK GT 1.2
@@ -165,14 +166,14 @@ def procesar_comando(texto, chat_id):
         telegram_send(chat_id, msg)
     except Exception as e:
         reconectar()
-        print("❌ Comando:", e)
+        print("❌ Error en Comando:", e, flush=True)
 
 # =========================
 # POLLING TELEGRAM
 # =========================
 def polling_telegram():
     uid = 0
-    print("🤖 Bot Ares iniciado...")
+    print("🤖 Bot Ares iniciado (Polling activo)...", flush=True)
     while True:
         try:
             r = requests.get(
@@ -184,10 +185,10 @@ def polling_telegram():
                 txt = msg.get("text", "")
                 cid = msg.get("chat", {}).get("id", TELEGRAM_CHAT)
                 if txt:
-                    print("📩", txt)
+                    print(f"📩 Mensaje recibido en Telegram: {txt}", flush=True)
                     procesar_comando(txt, cid)
         except Exception as e:
-            print("⚠ Polling:", e)
+            print("⚠ Error Polling Telegram:", e, flush=True)
         time.sleep(2)
 
 # =========================
@@ -198,7 +199,7 @@ MQTT_PORT   = 1883
 MQTT_TOPIC  = "sparkgt/jep488/telemetria"
 
 def on_connect(client, userdata, flags, rc):
-    print(f"✔ Conectado exitosamente al Broker MQTT. Código: {rc}")
+    print(f"✔ Conectado exitosamente al Broker MQTT. Código: {rc}", flush=True)
     client.subscribe(MQTT_TOPIC)
 
 def on_message(client, userdata, msg):
@@ -277,19 +278,27 @@ def on_message(client, userdata, msg):
             """, (placa,rpm,velocidad,temperatura,tps,map_p,engine_load,iat,
                   accX,accY,accZ,angleX,angleY,km_n,cc,cn))
             db.commit()
-            print(f"✔ Inserción Completa - {placa} RPM:{rpm} Vel:{velocidad} Km:{km_n:.3f}")
+            print(f"✔ Inserción Completa - {placa} RPM:{rpm} Vel:{velocidad} Km:{km_n:.3f}", flush=True)
         except Exception as e:
-            print("❌ Error insertando datos en MySQL:", e)
+            print("❌ Error insertando datos en MySQL:", e, flush=True)
             reconectar()
 
     except Exception as e:
-        print("❌ Error procesando estructura JSON:", e)
+        print("❌ Error procesando estructura JSON MQTT:", e, flush=True)
 
 # Inicialización del demonio MQTT
 mqtt_client = mqtt.Client()
 mqtt_client.on_connect = on_connect
 mqtt_client.on_message = on_message
 mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+
+# ============================================================
+# ARRANQUE DE HILOS PARA PRODUCCIÓN (GUNICORN / RENDER)
+# ============================================================
+# Al estar fuera del bloque __main__, se ejecutarán sí o sí bajo Render
+print("🚀 [PRODUCCIÓN] Iniciando hilos de soporte...", flush=True)
+threading.Thread(target=polling_telegram, daemon=True).start()
+mqtt_client.loop_start() 
 
 # =========================
 # RUTAS HTTP (Flask / Render Health Check)
@@ -313,13 +322,6 @@ def reset_km():
     except Exception as e:
         return f"Error: {e}", 500
 
-# =========================
-# MAIN
-# =========================
+# Bloque local por si deseas probar el archivo directamente en tu PC
 if __name__ == '__main__':
-    # Hilos secundarios de procesamiento continuo
-    threading.Thread(target=polling_telegram, daemon=True).start()
-    mqtt_client.loop_start() 
-    
-    # Servidor web principal para evitar el timeout de Render
     app.run(host='0.0.0.0', port=5000, debug=False)
