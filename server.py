@@ -4,6 +4,8 @@ from datetime import datetime
 import requests
 import threading
 import time
+import json
+import paho.mqtt.client as mqtt
 
 app = Flask(__name__)
 
@@ -189,102 +191,113 @@ def polling_telegram():
         time.sleep(2)
 
 # =========================
-# RUTA PRINCIPAL
+# GESTIÓN INGESTA MQTT
+# =========================
+MQTT_BROKER = "broker.hivemq.com"
+MQTT_PORT   = 1883
+MQTT_TOPIC  = "sparkgt/jep488/telemetria"
+
+def on_connect(client, userdata, flags, rc):
+    print(f"✔ Conectado exitosamente al Broker MQTT. Código: {rc}")
+    client.subscribe(MQTT_TOPIC)
+
+def on_message(client, userdata, msg):
+    try:
+        datos = json.loads(msg.payload.decode('utf-8'))
+        
+        placa       = datos.get("placa", "JEP488")
+        rpm         = datos.get("rpm", 0)
+        velocidad   = datos.get("velocidad", 0)
+        temperatura = datos.get("temperatura", 0)
+        tps         = datos.get("tps", 0)
+        map_p       = datos.get("map", 0)
+        engine_load = datos.get("load", 0)
+        iat         = datos.get("iat", 25)
+        accX        = datos.get("accx", 0)
+        accY        = datos.get("accy", 0)
+        accZ        = datos.get("accz", 0)
+        angleX      = datos.get("anglex", 0)
+        angleY      = datos.get("angley", 0)
+
+        if not valor_valido(rpm, 1, 8000) or not valor_valido(temperatura, -39, 130):
+            return
+
+        vel  = float(velocidad)
+        rpmf = float(rpm)
+        tmpf = float(temperatura)
+        tpsf = float(tps)
+        ayf  = float(accY)
+
+        global ultimo_vel
+        if placa not in ultimo_vel: ultimo_vel[placa] = 0
+        caida = ultimo_vel[placa] - vel
+
+        # Monitoreo de alertas
+        if vel > 120:
+            enviar_alerta("VELOCIDAD", f"🚗 *{placa}*\n🏎️ Exceso velocidad *{vel:.0f} km/h*", placa)
+        if ultimo_vel[placa] > 20 and caida > 25:
+            enviar_alerta("FRENADA", f"🚗 *{placa}*\n⚠️ Frenada brusca\n{ultimo_vel[placa]:.0f}→{vel:.0f} km/h", placa)
+        if rpmf > 3500 and tpsf > 35 and vel > 15:
+            enviar_alerta("ACELERACION", f"🚗 *{placa}*\n🔥 Aceleración agresiva\nRPM: *{rpmf:.0f}*", placa)
+        if abs(ayf) > 0.40 and vel > 25:
+            enviar_alerta("CURVA", f"🚗 *{placa}*\n📐 Curva brusca *{ayf:.2f}g*", placa)
+        if tmpf >= 109:
+            enviar_alerta("TEMPERATURA", f"🚗 *{placa}*\n🌡️ Temp crítica *{tmpf:.1f}°C*", placa)
+
+        ultimo_vel[placa] = vel
+
+        # Integración con base de datos e histórico
+        try:
+            cursor.execute("""
+                SELECT km_total,consumo_acum,fecha 
+                FROM telemetria WHERE placa=%s 
+                ORDER BY id DESC LIMIT 1
+            """, (placa,))
+            row = cursor.fetchone()
+            if row:
+                km_a = float(row[0]); ca = float(row[1])
+                seg  = max(0.5, min((datetime.now()-row[2]).total_seconds(), 10))
+            else:
+                km_a = 0; ca = 0; seg = 2
+            km_n  = km_a + (vel * seg/3600)
+            cc    = calcular_consumo(rpm, map_p, iat, tps, engine_load, seg)
+            cn    = ca + cc
+        except:
+            reconectar()
+            km_n = cc = cn = 0
+
+        try:
+            cursor.execute("""
+                INSERT INTO telemetria (
+                    placa,rpm,velocidad,temperatura,tps,
+                    map_pressure,engine_load,iat,
+                    accX,accY,accZ,angleX,angleY,
+                    km_total,consumo_gal,consumo_acum
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (placa,rpm,velocidad,temperatura,tps,map_p,engine_load,iat,
+                  accX,accY,accZ,angleX,angleY,km_n,cc,cn))
+            db.commit()
+            print(f"✔ Inserción Completa - {placa} RPM:{rpm} Vel:{velocidad} Km:{km_n:.3f}")
+        except Exception as e:
+            print("❌ Error insertando datos en MySQL:", e)
+            reconectar()
+
+    except Exception as e:
+        print("❌ Error procesando estructura JSON:", e)
+
+# Inicialización del demonio MQTT
+mqtt_client = mqtt.Client()
+mqtt_client.on_connect = on_connect
+mqtt_client.on_message = on_message
+mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+
+# =========================
+# RUTAS HTTP (Flask / Render Health Check)
 # =========================
 @app.route('/')
 def index():
-    return "OBD Server OK", 200
+    return "OBD Server OK (MQTT Listening)", 200
 
-# =========================
-# RUTA OBD
-# =========================
-@app.route('/obd')
-def obd():
-    placa       = request.args.get("placa",       "JEP488")
-    rpm         = request.args.get("rpm",          0)
-    velocidad   = request.args.get("velocidad",    0)
-    temperatura = request.args.get("temperatura",  0)
-    tps         = request.args.get("tps",          0)
-    map_p       = request.args.get("map",          0)
-    engine_load = request.args.get("load",         0)
-    iat         = request.args.get("iat",          25)
-    accX        = request.args.get("accx",         0)
-    accY        = request.args.get("accy",         0)
-    accZ        = request.args.get("accz",         0)
-    angleX      = request.args.get("anglex",       0)
-    angleY      = request.args.get("angley",       0)
-
-    if not valor_valido(rpm, 1, 8000):   return "RPM inválida", 200
-    if not valor_valido(temperatura, -39, 130): return "Temp inválida", 200
-
-    vel  = float(velocidad)
-    rpmf = float(rpm)
-    tmpf = float(temperatura)
-    tpsf = float(tps)
-    ayf  = float(accY)
-
-    if placa not in ultimo_vel: ultimo_vel[placa] = 0
-    caida = ultimo_vel[placa] - vel
-
-    if vel > 120:
-        enviar_alerta("VELOCIDAD",
-            f"🚗 *{placa}*\n🏎️ Exceso velocidad *{vel:.0f} km/h*", placa)
-    if ultimo_vel[placa] > 20 and caida > 25:
-        enviar_alerta("FRENADA",
-            f"🚗 *{placa}*\n⚠️ Frenada brusca\n{ultimo_vel[placa]:.0f}→{vel:.0f} km/h", placa)
-    if rpmf > 3500 and tpsf > 35 and vel > 15:
-        enviar_alerta("ACELERACION",
-            f"🚗 *{placa}*\n🔥 Aceleración agresiva\nRPM: *{rpmf:.0f}*", placa)
-    if abs(ayf) > 0.40 and vel > 25:
-        enviar_alerta("CURVA",
-            f"🚗 *{placa}*\n📐 Curva brusca *{ayf:.2f}g*", placa)
-    if tmpf >= 109:
-        enviar_alerta("TEMPERATURA",
-            f"🚗 *{placa}*\n🌡️ Temp crítica *{tmpf:.1f}°C*", placa)
-
-    ultimo_vel[placa] = vel
-
-    try:
-        cursor.execute("""
-            SELECT km_total,consumo_acum,fecha
-            FROM telemetria WHERE placa=%s
-            ORDER BY id DESC LIMIT 1
-        """, (placa,))
-        row = cursor.fetchone()
-        if row:
-            km_a = float(row[0]); ca = float(row[1])
-            seg  = max(0.5, min((datetime.now()-row[2]).total_seconds(), 10))
-        else:
-            km_a = 0; ca = 0; seg = 2
-        km_n  = km_a + (vel * seg/3600)
-        cc    = calcular_consumo(rpm, map_p, iat, tps, engine_load, seg)
-        cn    = ca + cc
-    except:
-        reconectar()
-        km_n = cc = cn = 0
-
-    try:
-        cursor.execute("""
-            INSERT INTO telemetria (
-                placa,rpm,velocidad,temperatura,tps,
-                map_pressure,engine_load,iat,
-                accX,accY,accZ,angleX,angleY,
-                km_total,consumo_gal,consumo_acum
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (placa,rpm,velocidad,temperatura,tps,map_p,engine_load,iat,
-              accX,accY,accZ,angleX,angleY,km_n,cc,cn))
-        db.commit()
-    except Exception as e:
-        print("❌ MySQL:", e)
-        reconectar()
-        return "Error MySQL", 500
-
-    print(f"✔ {placa} RPM:{rpm} Vel:{velocidad} Km:{km_n:.3f} Gal:{cn:.5f}")
-    return "OK", 200
-
-# =========================
-# RESET
-# =========================
 @app.route('/reset_km')
 def reset_km():
     placa = request.args.get("placa","JEP488")
@@ -304,5 +317,9 @@ def reset_km():
 # MAIN
 # =========================
 if __name__ == '__main__':
+    # Hilos secundarios de procesamiento continuo
     threading.Thread(target=polling_telegram, daemon=True).start()
+    mqtt_client.loop_start() 
+    
+    # Servidor web principal para evitar el timeout de Render
     app.run(host='0.0.0.0', port=5000, debug=False)

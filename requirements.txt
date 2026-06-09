@@ -3,3 +3,4 @@ mysql-connector-python
 requests
 pycryptodome
 gunicorn
+paho-mqtt
